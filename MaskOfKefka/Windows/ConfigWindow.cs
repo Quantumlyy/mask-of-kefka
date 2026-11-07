@@ -61,7 +61,7 @@ public class ConfigWindow : Window
                 config.Save();
             }
 
-            ImGui.TextDisabled($"Range: 0 to {GameSources.RenderTargetSlotCount - 1}. Use -1 to disable.");
+            ImGui.TextDisabled($"Range: 0 to {GameSources.RenderTargetSlotCount - 1}. Use -1 to disable. Slots that do not hold a live texture fall back to the UI mode.");
 
             if (ImGui.Button("List render targets to log"))
                 GameSources.DumpRenderTargets(Plugin.Log);

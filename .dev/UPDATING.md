@@ -20,12 +20,13 @@ This plugin was designed to break as little as possible, but FFXIV plus Dalamud 
 
 | Dependency | Maintained by | Where it lives | Breaks when |
 |---|---|---|---|
-| `Dalamud.NET.Sdk/15.0.0` | goatcorp | `MaskOfKefka/MaskOfKefka.csproj` (line 1) | Dalamud bumps its major version (new API level) |
+| `Dalamud.NET.Sdk/15.0.0` (last verified against Dalamud 15.0.3.9, Nov 2026) | goatcorp | `MaskOfKefka/MaskOfKefka.csproj` (line 1) | Dalamud bumps its major version (new API level) |
 | Dalamud API (`UiBuilder`, `Window`, `IPluginLog`, ImGui bindings) | goatcorp | `Plugin.cs`, `Windows/ConfigWindow.cs` | Breaking changes in a major Dalamud release |
 | `Device.Instance()`, `D3D11Forwarder`, `D3D11DeviceContext`, `SwapChain` | FFXIVClientStructs (community) | `Capture/GameSources.cs`, `Output/OutputSession.cs` | Rarely; the community updates the offsets for us |
 | `SwapChain.BackBuffer`, `.Width`, `.Height` | FFXIVClientStructs | `Capture/GameSources.cs`, `Output/OutputSession.cs` | Same |
 | `Texture.D3D11Texture2D`, `.D3D11ShaderResourceView`, `.ActualWidth/Height` | FFXIVClientStructs | `Capture/GameSources.cs` | Same |
 | Offset `0x20` of the render target table | **us** | `GameSources.RenderTargetTableOffset` | If the `RenderTargetManager` layout changes |
+| Pointer validation (`VirtualQuery`, vtable-in-image checks) | **us** | `GameSources.TryResolveTexture` | Only if the game stops being a plain Win32 process (never) |
 | The no-UI render target index | **user, at runtime** | Plugin config (UI), `Configuration.RenderTargetIndex` | Practically every graphics patch |
 | TerraFX.Interop.Windows | goatcorp (ships it) | `MaskOfKefka.csproj` (HintPath) | Only if Dalamud stops shipping it |
 
@@ -71,6 +72,22 @@ If a field disappeared or was renamed, the compile error points at the exact spo
 
 `GameSources.RenderTargetTableOffset = 0x20` assumes the `Texture*` pointers in `RenderTargetManager` form a contiguous table starting at `+0x20` (currently the `_gBuffers` field). **How to validate**: open `RenderTargetManager.cs` in the repo and check the offset of the first `Texture*` field or texture array. If it moved, update the constant. This offset has been stable for years, but it is the only layout assumption that is **ours**, which is why it is isolated in a documented constant.
 
+The scan range is the whole struct (`sizeof(RenderTargetManager)`, 0x740 as of FFXIVClientStructs 7.57 / Dalamud 15.0.3). That range is **not** all texture pointers. As of this writing it contains:
+
+- `+0x20` to `+0x420`: `Texture*` (G-buffers, lights, shadows, depth, CharaView, `ToneAdjustSource` at `+0x370`).
+- `+0x428` to `+0x4A8`: scalars (`Resolution_Width/Height`, shadow map sizes, flags, `DepthOfFieldSourceIndex`).
+- `+0x4A8` to `+0x6A0`: `Texture*` again (`SwapChainBackBuffer` at `+0x570`, depth history, GTAO, velocity, depth of field).
+- `+0x6A0` onwards: pointers to **other** classes, render heights, floats, a function pointer.
+
+A scalar slot such as `Resolution_Width|Height` (`1920x1080` packs as `0x0000043800000780`) looks exactly like an aligned user-space pointer. Dereferencing it is an access violation, which .NET cannot catch: the game dies with `AccessViolationException` in `GameSources.DumpRenderTargets` (seen on Dalamud 15.0.3.9, Nov 2026). This is why every slot goes through `GameSources.TryResolveTexture` before it is read:
+
+1. `VirtualQuery`: the `Texture` struct must be committed, readable memory.
+2. Its first qword (vtable) must point into a loaded image (`ffxiv_dx11.exe`).
+3. Width and height must be within 1..16384.
+4. `D3D11Texture2D` must itself be readable and have a vtable in a loaded image (`d3d11.dll`).
+
+Keep that function in front of **every** dereference of a slot, including the backbuffer path. Do not "optimize" it away with a cache: the checks cost a few microseconds per frame.
+
 ## 3. The no-UI render target index
 
 **Symptom**: the no-UI mode shows the wrong texture (shadow map, depth, black screen). The UI mode keeps working since it uses no index at all.
@@ -81,7 +98,9 @@ No code needed. In game:
 2. Click **"List render targets to log"** and open `/xllog`: every plausible slot is listed with index, resolution and format. The candidates have **your screen's resolution** and `srv=yes`.
 3. Try the candidate indices in the "Render target index" field while watching the output window. When the scene shows up without UI, that is the one. The config saves itself.
 
-(For reference: in the original plugin's era it was 71; these indices shift whenever Square Enix touches the graphics pipeline.)
+The dump marks candidates with `*` (swapchain resolution, color format, `srv=yes`), prints the struct offset of each slot (`+0x...`) so you can look the name up in `RenderTargetManager.cs`, and flags the slot that is the swapchain backbuffer itself (it has the UI in it). Slots that are not live textures are skipped, and typing such an index into the config is harmless: the output falls back to the UI mode for that frame.
+
+(For reference: in the original plugin's era it was 71, which is `+0x258` today; these indices shift whenever Square Enix touches the graphics pipeline.)
 
 ## 4. Structural Dalamud changes worth watching
 
