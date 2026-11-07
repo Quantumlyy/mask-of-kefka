@@ -1,0 +1,209 @@
+# Reusable build + version bump + release workflow, called by release-plugin.yml. Bumps <Version>
+# in the csproj, builds, commits the bump, creates the GitHub release with the packager's
+# latest.zip, then publishes the generated manifest into the Dalamud plugin repository (a plain data
+# repository: pluginmaster.json is regenerated here, so it needs no workflows of its own. Its README
+# is maintained there by hand, since it lists every plugin served from it).
+name: Build plugin
+
+on:
+  workflow_call:
+    inputs:
+      internal_name:
+        description: Plugin InternalName (also the csproj/sln folder name)
+        required: true
+        type: string
+      solution_name:
+        description: Solution file name without .sln
+        required: true
+        type: string
+      version_bump:
+        description: Which <Version> segment to bump - major | minor | patch | revision
+        required: false
+        type: string
+        default: patch
+      plugin_repo:
+        description: owner/name of the Dalamud plugin repository that receives the manifest and pluginmaster.json
+        required: true
+        type: string
+      plugin_repo_branch:
+        description: Branch of plugin_repo to commit to
+        required: false
+        type: string
+        default: main
+      release_dir:
+        description: Build output dir. Defaults to <internal_name>/bin/x64/Release/<internal_name>
+        required: false
+        type: string
+        default: ''
+      csproj_path:
+        description: Path to the project file. Defaults to <internal_name>/<internal_name>.csproj
+        required: false
+        type: string
+        default: ''
+    secrets:
+      PAT:
+        description: Token with Contents write access to plugin_repo
+        required: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: write          # create the release + push the version-bump commit in THIS (caller) repo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Bump version
+        id: bump
+        shell: pwsh
+        env:
+          INTERNAL_NAME: ${{ inputs.internal_name }}
+          CSPROJ_PATH: ${{ inputs.csproj_path }}
+          VERSION_BUMP: ${{ inputs.version_bump }}
+        run: |
+          $internal = $env:INTERNAL_NAME
+          $csproj = $env:CSPROJ_PATH
+          if ([string]::IsNullOrWhiteSpace($csproj)) { $csproj = "$internal/$internal.csproj" }
+          $bump = $env:VERSION_BUMP.ToLower()
+          $idx = @{ 'major' = 0; 'minor' = 1; 'patch' = 2; 'revision' = 3 }
+          if (-not $idx.ContainsKey($bump)) { throw "Invalid version_bump '$bump' (use major|minor|patch|revision)" }
+
+          $content = Get-Content $csproj -Raw
+          $rx = '<Version>\s*([0-9]+(?:\.[0-9]+){0,3})\s*</Version>'
+          $m = [regex]::Match($content, $rx)
+          if (-not $m.Success) { throw "No <Version> element found in $csproj" }
+
+          $parts = @($m.Groups[1].Value.Split('.') | ForEach-Object { [int]$_ })
+          while ($parts.Count -lt 4) { $parts += 0 }
+          $i = $idx[$bump]
+          $parts[$i] = $parts[$i] + 1
+          for ($j = $i + 1; $j -lt 4; $j++) { $parts[$j] = 0 }
+          $new = ($parts -join '.')
+
+          $content = [regex]::Replace($content, $rx, "<Version>$new</Version>")
+          [System.IO.File]::WriteAllText((Resolve-Path $csproj).Path, $content)
+
+          Write-Host "Bumped $bump : $($m.Groups[1].Value) -> $new"
+          "version=$new"   >> $env:GITHUB_OUTPUT
+          "csproj=$csproj" >> $env:GITHUB_OUTPUT
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download Dalamud
+        run: |
+          Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile latest.zip
+          Expand-Archive -Force latest.zip "$env:AppData\XIVLauncher\addon\Hooks\dev"
+
+      - name: Build
+        run: |
+          dotnet restore -r win ${{ inputs.solution_name }}.sln
+          dotnet build --configuration Release
+
+      - name: Commit version bump
+        id: bumpcommit
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: ${{ steps.bump.outputs.csproj }}
+          message: Bump ${{ inputs.internal_name }} to v${{ steps.bump.outputs.version }}
+          author_name: GitHub Action
+          author_email: github-actions[bot]@users.noreply.github.com
+          default_author: user_info
+
+      - name: Resolve paths
+        id: meta
+        shell: pwsh
+        env:
+          INTERNAL_NAME: ${{ inputs.internal_name }}
+          RELEASE_DIR: ${{ inputs.release_dir }}
+        run: |
+          $internal = $env:INTERNAL_NAME
+          $dir = $env:RELEASE_DIR
+          if ([string]::IsNullOrWhiteSpace($dir)) { $dir = "$internal/bin/x64/Release/$internal" }
+          "manifest=$(Join-Path $dir "$internal.json")" >> $env:GITHUB_OUTPUT
+          "zip=$dir/latest.zip"                          >> $env:GITHUB_OUTPUT
+
+      - name: Find previous release tag
+        id: prevtag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $prev = (gh release view --json tagName --jq '.tagName' 2>$null)
+          if (-not $prev) { $prev = '' }
+          "tag=$prev" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Build changelog (PRs + commits)
+        id: changelog
+        uses: mikepenz/release-changelog-builder-action@v6
+        with:
+          mode: HYBRID
+          fromTag: ${{ steps.prevtag.outputs.tag }}
+          toTag: ${{ github.sha }}          # last real commit, excludes the automated bump commit
+          failOnError: false
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Create release (this repo)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.bump.outputs.version }}
+          name: v${{ steps.bump.outputs.version }}
+          target_commitish: ${{ steps.bumpcommit.outputs.commit_long_sha }}
+          body: ${{ steps.changelog.outputs.changelog }}
+          files: ${{ steps.meta.outputs.zip }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Checkout plugin repository
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.plugin_repo }}
+          ref: ${{ inputs.plugin_repo_branch }}
+          token: ${{ secrets.PAT }}
+          path: plugin-repo
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The manifest records which repository's releases it is served from, so the download link
+      # does not depend on the manifest's RepoUrl (the project page) being that repository.
+      - name: Stage manifest and generator
+        shell: pwsh
+        env:
+          INTERNAL_NAME: ${{ inputs.internal_name }}
+          MANIFEST: ${{ steps.meta.outputs.manifest }}
+          RELEASES_REPO: ${{ github.repository }}
+        run: |
+          $dest = "plugin-repo/plugins/$env:INTERNAL_NAME"
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          python tools/pluginrepo/stage_manifest.py $env:MANIFEST "$dest/$env:INTERNAL_NAME.json" $env:RELEASES_REPO
+          Copy-Item tools/pluginrepo/generate_pluginmaster.py plugin-repo/generate_pluginmaster.py -Force
+
+      - name: Regenerate pluginmaster.json
+        working-directory: plugin-repo
+        run: python generate_pluginmaster.py
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Commit to plugin repository
+        uses: EndBug/add-and-commit@v9
+        with:
+          cwd: plugin-repo
+          add: --all
+          message: Update ${{ inputs.internal_name }} to v${{ steps.bump.outputs.version }}
+          author_name: GitHub Action
+          author_email: github-actions[bot]@users.noreply.github.com
+          default_author: user_info

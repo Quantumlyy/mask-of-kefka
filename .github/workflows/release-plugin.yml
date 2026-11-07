@@ -1,0 +1,31 @@
+name: Release plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: Which version segment to bump
+        type: choice
+        default: patch
+        options:
+          - major
+          - minor
+          - patch
+          - revision
+
+permissions:
+  contents: write          # lets the reusable workflow create the release + push the bump commit
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-plugin.yml
+    with:
+      internal_name: MaskOfKefka
+      solution_name: MaskOfKefka
+      version_bump: ${{ inputs.version_bump }}
+      # The solution builds as Any CPU, so the packager output has no x64 segment.
+      release_dir: MaskOfKefka/bin/Release/MaskOfKefka
+      plugin_repo: Quantumlyy/MyDalamudPlugins
+      plugin_repo_branch: main
+    secrets:
+      PAT: ${{ secrets.GH_PREPO_PAT }}
